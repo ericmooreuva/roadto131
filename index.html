@@ -208,41 +208,60 @@ let SESSION=null; // {username,role,name}
 
 const DB = {
   get(k,def){ const v=STATE[k]; return (v===undefined||v===null)?def:v; },
-  set(k,v){ STATE[k]=v; persistLocal(); pushCloud(); }
+  set(k,v){ STATE[k]=v; persistLocal(); pushColl(k); }
 };
 function shaped(d){return {users:(d&&d.users)||[],entries:(d&&d.entries)||[],goals:(d&&d.goals)||{},workouts:(d&&d.workouts)||[],comments:(d&&d.comments)||[]};}
 function persistLocal(){ try{localStorage.setItem(LS,JSON.stringify(STATE))}catch(e){} }
-function adoptState(d){ STATE=shaped(d); persistLocal(); }
 
-/* ---- cloud (Firebase Realtime DB REST) ---- */
+/* ---- cloud (Firebase Realtime DB REST), GRANULAR per-item writes ----
+   Each collection is stored under its own path so two devices never
+   overwrite each other's data. Writes PATCH only the changed items. */
 function cloudOn(){ return /^https?:\/\//.test(CLOUD_URL); }
-function cloudEndpoint(){ return CLOUD_URL.replace(/\/+$/,'')+'/roadto131.json'; }
-let pushTimer=null;
-function pushCloud(){
+function cloudRoot(sub){ return CLOUD_URL.replace(/\/+$/,'')+'/roadto131'+(sub||'')+'.json'; }
+const COLLKEY={users:u=>u.username, entries:e=>e.id, workouts:w=>w.id, comments:c=>c.id};
+let MIRROR={users:{},entries:{},workouts:{},comments:{},goals:{}}; // last-known cloud maps
+function safeKey(k){ return String(k).replace(/[.#$\[\]\/]/g,'_'); }
+function toMap(coll,val){
+  if(coll==='goals') return val||{};
+  const m={}; (val||[]).forEach(it=>{ const k=COLLKEY[coll](it); if(k!=null) m[safeKey(k)]=it; }); return m;
+}
+function fromMap(coll,m){ if(coll==='goals') return m||{}; return m?Object.keys(m).map(k=>m[k]):[]; }
+function normMap(x){ if(!x) return {}; if(Array.isArray(x)){const m={};x.forEach((v,i)=>{if(v!=null)m[i]=v});return m;} return x; }
+function rawToMaps(raw){ raw=raw||{}; return {users:normMap(raw.users),entries:normMap(raw.entries),workouts:normMap(raw.workouts),comments:normMap(raw.comments),goals:normMap(raw.goals)}; }
+function adoptCloud(raw){
+  const m=rawToMaps(raw); MIRROR=m;
+  STATE={users:fromMap('users',m.users),entries:fromMap('entries',m.entries),workouts:fromMap('workouts',m.workouts),comments:fromMap('comments',m.comments),goals:m.goals||{}};
+  persistLocal();
+}
+function pushColl(coll){
   if(!cloudOn()) return;
-  clearTimeout(pushTimer);
-  pushTimer=setTimeout(()=>{
-    fetch(cloudEndpoint(),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(STATE)})
-      .catch(e=>console.warn('cloud push failed',e));
-  },400);
+  const desired=toMap(coll,STATE[coll]), prev=MIRROR[coll]||{}, updates={};
+  for(const k in desired){ if(JSON.stringify(desired[k])!==JSON.stringify(prev[k])) updates[k]=desired[k]; }
+  for(const k in prev){ if(!(k in desired)) updates[k]=null; }
+  MIRROR[coll]=desired;
+  if(!Object.keys(updates).length) return;
+  fetch(cloudRoot('/'+coll),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(updates)})
+    .catch(e=>console.warn('cloud push failed',coll,e));
 }
 async function pullCloud(){
   if(!cloudOn()) return null;
-  try{ const r=await fetch(cloudEndpoint(),{cache:'no-store'}); if(!r.ok) return null; return await r.json(); }
+  try{ const r=await fetch(cloudRoot(),{cache:'no-store'}); if(!r.ok) return null; return await r.json(); }
   catch(e){ console.warn('cloud pull failed',e); return null; }
 }
-// near-realtime: pull every 12s and re-render read-only views if data changed
+// near-realtime: pull every 10s; refresh MIRROR and re-render read-only views if data changed
 const SAFE_REFRESH=new Set(['dashboard','history','calendar','roster','athlete','users']);
 function startSync(){
   if(!cloudOn()) return;
   setInterval(async()=>{
-    const d=await pullCloud(); if(!d) return;
-    const ns=shaped(d);
-    if(JSON.stringify(ns)!==JSON.stringify(STATE)){
-      STATE=ns; persistLocal();
+    const raw=await pullCloud(); if(raw===null) return;
+    const m=rawToMaps(raw);
+    const cand={users:fromMap('users',m.users),entries:fromMap('entries',m.entries),workouts:fromMap('workouts',m.workouts),comments:fromMap('comments',m.comments),goals:m.goals||{}};
+    MIRROR=m;
+    if(JSON.stringify(cand)!==JSON.stringify(STATE)){
+      STATE=cand; persistLocal();
       if(SESSION && !el('modalRoot').innerHTML && SAFE_REFRESH.has(CURRENT)) go(CURRENT);
     }
-  },12000);
+  },10000);
 }
 
 /* ---- password hashing ---- */
@@ -259,12 +278,12 @@ async function sha(text){
 async function migratePasswords(){
   let changed=false;
   for(const u of STATE.users){ if(u.password && !u.pass){ u.pass=await sha(u.password); delete u.password; changed=true; } }
-  if(changed){ persistLocal(); pushCloud(); }
+  if(changed){ persistLocal(); pushColl('users'); }
 }
 async function ensureSeed(){
   if(!STATE.users || STATE.users.length===0){
     STATE.users=[{username:'eric', pass:await sha('gohoos'), name:'Eric (Coach)', role:'admin'}];
-    persistLocal(); pushCloud();
+    persistLocal(); pushColl('users');
   }
 }
 
@@ -281,7 +300,7 @@ function loginMsg(t,type){ const e=document.getElementById('loginMsg'); e.innerH
 async function doLogin(){
   const u=val('li_user').trim(), p=val('li_pass');
   if(!u||!p){loginMsg('Enter username and password.');return;}
-  if(cloudOn()){ const d=await pullCloud(); if(d) adoptState(d); }
+  if(cloudOn()){ const d=await pullCloud(); if(d!==null) adoptCloud(d); }
   const user=DB.get(KEY.users,[]).find(x=>x.username.toLowerCase()===u.toLowerCase());
   const ph=await sha(p);
   if(!user||user.pass!==ph){loginMsg('Incorrect username or password.');return;}
@@ -290,9 +309,10 @@ async function doLogin(){
   enterApp();
 }
 async function doRegister(){
-  const name=val('rg_name').trim(), u=val('rg_user').trim(), p=val('rg_pass');
-  if(!name||!u||!p){loginMsg('Fill in all fields.');return;}
-  if(cloudOn()){ const d=await pullCloud(); if(d) adoptState(d); }
+  const name=val('rg_name').trim(), p=val('rg_pass');
+  let u=val('rg_user').trim().replace(/[^a-zA-Z0-9_]/g,'');
+  if(!name||!u||!p){loginMsg('Fill in all fields (username: letters, numbers, underscore).');return;}
+  if(cloudOn()){ const d=await pullCloud(); if(d!==null) adoptCloud(d); }
   const users=DB.get(KEY.users,[]);
   if(users.some(x=>x.username.toLowerCase()===u.toLowerCase())){loginMsg('That username is taken.');return;}
   users.push({username:u,pass:await sha(p),name:name,role:'athlete'});
@@ -822,8 +842,9 @@ function renderUsers(){
   </div>`;
 }
 async function addUser(){
-  const name=val('nu_name').trim(),u=val('nu_user').trim(),p=val('nu_pass');
-  if(!name||!u||!p){toast('Fill in all fields');return;}
+  const name=val('nu_name').trim(),p=val('nu_pass');
+  const u=val('nu_user').trim().replace(/[^a-zA-Z0-9_]/g,'');
+  if(!name||!u||!p){toast('Fill in all fields (username: letters/numbers/_)');return;}
   const users=DB.get(KEY.users,[]);
   if(users.some(x=>x.username.toLowerCase()===u.toLowerCase())){toast('Username taken');return;}
   users.push({username:u,pass:await sha(p),name,role:val('nu_role')});
@@ -852,18 +873,12 @@ function closeModal(){el('modalRoot').innerHTML=''}
    BOOT
 ============================================================ */
 (async function(){
-  // 1. load local cache
   try{ const c=JSON.parse(localStorage.getItem(LS)); if(c) STATE=shaped(c); }catch(e){}
-  // 2. pull cloud (authoritative when configured)
-  if(cloudOn()){ const d=await pullCloud(); if(d) adoptState(d); }
-  // 3. upgrade any plaintext passwords, then seed admin if empty
+  if(cloudOn()){ const raw=await pullCloud(); if(raw!==null) adoptCloud(raw); }
   await migratePasswords();
   await ensureSeed();
-  // 4. keep in sync
   startSync();
-  // 5. restore session
   try{ const s=JSON.parse(localStorage.getItem(LS_SESSION)); if(s&&STATE.users.some(u=>u.username===s.username)){SESSION=s;enterApp();} }catch(e){}
-  // enter key on login
   document.addEventListener('keydown',e=>{
     if(e.key==='Enter'&&!el('loginScreen').classList.contains('hidden')){
       if(!el('signinForm').classList.contains('hidden'))doLogin();
