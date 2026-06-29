@@ -259,7 +259,7 @@ function startSync(){
     MIRROR=m;
     if(JSON.stringify(cand)!==JSON.stringify(STATE)){
       STATE=cand; persistLocal();
-      if(SESSION && !el('modalRoot').innerHTML && SAFE_REFRESH.has(CURRENT)) go(CURRENT);
+      if(SESSION && !el('modalRoot').innerHTML && !FORM_OPEN && SAFE_REFRESH.has(CURRENT)) go(CURRENT);
     }
   },10000);
 }
@@ -372,9 +372,10 @@ function athletes(){return DB.get(KEY.users,[]).filter(u=>u.role==='athlete')}
    TABS / ROUTER
 ============================================================ */
 let CURRENT='dashboard';
+let FORM_OPEN=false; // true while the log form occupies the view (prevents auto-refresh wiping it)
 let ADMIN_VIEW_USER=null; // which athlete admin is inspecting
 
-const ATHLETE_TABS=[['dashboard','Dashboard'],['log','Log a Run'],['history','History'],['calendar','Calendar'],['goals','Goals']];
+const ATHLETE_TABS=[['dashboard','Dashboard'],['calendar','Calendar'],['history','History'],['goals','Goals']];
 const ADMIN_TABS=[['roster','Roster'],['athlete','Athlete View'],['assign','Assign Workout'],['users','Manage Users']];
 
 function buildTabs(){
@@ -386,7 +387,7 @@ function buildTabs(){
   });
 }
 function go(tab){
-  CURRENT=tab;
+  CURRENT=tab; FORM_OPEN=false;
   [...el('tabBar').children].forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
   const v=el('view');v.scrollTop=0;
   const r={
@@ -453,7 +454,7 @@ function renderDashboard(){
         ${es.slice(0,6).map(e=>`<tr onclick="viewEntry('${e.id}')" style="cursor:pointer">
           <td>${fmtDate(e.date)}</td><td>${typeTag(e.type)}</td>
           <td>${(+e.distance||0)} ${e.unit}</td><td>${paceFrom(+e.distance,e.unit,e.dur)}</td></tr>`).join('')}
-        </tbody></table>`:'<div class="empty">No runs yet. <button class="link" onclick="go(\'log\')">Log your first run →</button></div>'}
+        </tbody></table>`:'<div class="empty">No runs yet. <button class="link" onclick="go(\'calendar\')">Go to your calendar →</button></div>'}
     </div>
     <div class="card">
       <h3>Assigned Workouts</h3>
@@ -466,19 +467,26 @@ function typeTag(t){const cls=t==='Cross-train'?'Cross':t;return `<span class="t
 /* ============================================================
    ATHLETE: LOG A RUN
 ============================================================ */
-function renderLog(editId){
+function renderLog(editId,prefill){
   const e=editId?allEntries().find(x=>x.id===editId):null;
+  prefill=prefill||{};
+  const wid=e?(e.workoutId||''):(prefill.workoutId||'');
   const v=(k,d='')=>e?(e[k]??d):d;
+  const dDate=e?e.date:(prefill.date||todayStr());
+  const dType=e?e.type:(prefill.type||'Easy');
   const dur=e?{h:Math.floor(e.dur/3600),m:Math.floor((e.dur%3600)/60),s:e.dur%60}:{h:'',m:'',s:''};
+  const completing=!e&&prefill.workoutId;
+  const cancelTarget=SESSION.role==='admin'?'athlete':'calendar';
   return `
-  <div class="page-title">${e?'Edit Run':'Log a Run'}</div>
-  <div class="page-sub">${e?'Update the details below.':'Record today\'s session — the more detail, the better the trends.'}</div>
+  <div class="page-title">${e?'Edit Run':(completing?'Complete Your Run':'Log a Run')}</div>
+  <div class="page-sub">${e?'Update the details below.':(completing?'Fill in how it actually went.':'Record this session — the more detail, the better the trends.')}</div>
+  ${completing&&prefill.desc?`<div class="card" style="max-width:780px;margin-bottom:14px;border-left:4px solid var(--orange)"><div style="font-size:12px;font-weight:700;color:#b35e00;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px">Coach assigned</div><div>${esc(prefill.desc)}</div></div>`:''}
   <div class="card" style="max-width:780px">
     <h3>Run Details</h3>
     <div class="row-form">
-      <div class="field"><label>Date</label><input id="f_date" type="date" value="${v('date',todayStr())}"></div>
+      <div class="field"><label>Date</label><input id="f_date" type="date" value="${dDate}"></div>
       <div class="field"><label>Run Type</label><select id="f_type">
-        ${['Easy','Workout','Long','Race','Recovery','Cross-train','Rest'].map(t=>`<option ${v('type','Easy')===t?'selected':''}>${t}</option>`).join('')}
+        ${['Easy','Workout','Long','Race','Recovery','Cross-train','Rest'].map(t=>`<option ${dType===t?'selected':''}>${t}</option>`).join('')}
       </select></div>
       <div class="field"><label>Surface</label><select id="f_surface">
         ${['Road','Track','Trail','Treadmill','Grass'].map(t=>`<option ${v('surface','Road')===t?'selected':''}>${t}</option>`).join('')}
@@ -510,13 +518,21 @@ function renderLog(editId){
     </div>
     <div class="form-actions">
       ${e?`<button class="btn btn-danger btn-sm" onclick="deleteEntry('${e.id}')">Delete</button>`:''}
-      <button class="btn btn-ghost btn-sm" onclick="go('dashboard')">Cancel</button>
-      <button class="btn btn-primary btn-sm" onclick="saveEntry('${e?e.id:''}')">${e?'Save Changes':'Save Run'}</button>
+      <button class="btn btn-ghost btn-sm" onclick="go('${cancelTarget}')">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="saveEntry('${e?e.id:''}','${wid}')">${e?'Save Changes':(completing?'Mark Complete ✓':'Save Run')}</button>
     </div>
   </div>`;
 }
-function saveEntry(editId){
+function showForm(html){el('view').innerHTML=html;window.scrollTo(0,0);}
+function logRun(dateStr){ closeModal(); showForm(renderLog('',{date:dateStr})); }
+function completeWorkout(wid){
+  const w=DB.get(KEY.workouts,[]).find(x=>x.id===wid); if(!w)return;
+  closeModal();
+  showForm(renderLog('',{date:w.date,type:w.type,desc:w.description,workoutId:w.id}));
+}
+function saveEntry(editId,workoutId){
   const dist=+val('f_dist');
+  const existing=editId?allEntries().find(x=>x.id===editId):null;
   const entry={
     id:editId||uid(), user:SESSION.username,
     date:val('f_date'), type:val('f_type'), surface:val('f_surface'),
@@ -524,15 +540,16 @@ function saveEntry(editId){
     dur:parseDur(val('f_h'),val('f_m'),val('f_s')),
     shoes:val('f_shoes'), splits:val('f_splits'),
     rpe:val('f_rpe'), sleep:val('f_sleep'), sore:val('f_sore'), hr:val('f_hr'),
-    feel:val('f_feel'), injury:val('f_injury'), notes:val('f_notes')
+    feel:val('f_feel'), injury:val('f_injury'), notes:val('f_notes'),
+    workoutId: workoutId || (existing&&existing.workoutId) || ''
   };
   if(!entry.date){toast('Pick a date');return;}
   const all=allEntries();
   const i=all.findIndex(x=>x.id===entry.id);
   if(i>=0)all[i]=entry; else all.push(entry);
   DB.set(KEY.entries,all);
-  toast(editId?'Run updated ✓':'Run logged ✓');
-  go('history');
+  toast(editId?'Run updated ✓':(entry.workoutId?'Run completed ✓':'Run logged ✓'));
+  go(SESSION.role==='admin'?'athlete':'calendar');
 }
 function deleteEntry(id){
   if(!confirm('Delete this run?'))return;
@@ -574,7 +591,7 @@ function historyTable(es,user,title,sub,canEdit,bare){
   return html;
 }
 function feelDot(f){const c={Great:'#2e9e5b',Good:'#62b878',OK:'#d9a72b',Tired:'#d9822b',Rough:'#c0392b'}[f]||'#ccc';return `<span class="feel-dot" style="background:${c}"></span>`}
-function editEntry(id){ if(SESSION.role==='admin'){go('athlete');} el('view').innerHTML=renderLog(id); window.scrollTo(0,0); }
+function editEntry(id){ showForm(renderLog(id)); }
 
 /* ============================================================
    ENTRY DETAIL MODAL (+comments)
@@ -629,7 +646,9 @@ function renderCalendar(){
   const user=SESSION.role==='admin'?ADMIN_VIEW_USER:SESSION.username;
   return calendarFor(user);
 }
+function workoutDone(w){ return allEntries().some(e=>e.workoutId===w.id); }
 function calendarFor(user){
+  const isAth=SESSION.role!=='admin';
   const y=CAL.getFullYear(),m=CAL.getMonth();
   const first=new Date(y,m,1), startDay=(first.getDay()+6)%7, days=new Date(y,m+1,0).getDate();
   const es=entriesOf(user), wks=workoutsOf(user);
@@ -640,19 +659,25 @@ function calendarFor(user){
   for(let d=1;d<=days;d++){
     const ds=`${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     const runs=byDate[ds]||[], wos=woByDate[ds]||[];
+    const freeRuns=runs.filter(e=>!e.workoutId);   // unprompted runs (shown as chips)
     const miles=runs.reduce((s,e)=>s+toMiles(+e.distance||0,e.unit),0);
     const isToday=ds===todayStr();
-    cells+=`<div style="border:1px solid var(--line);border-radius:10px;min-height:84px;padding:6px;background:${isToday?'#fff7ef':'#fff'};${isToday?'border-color:var(--orange)':''}">
+    const click=isAth?`onclick="openDay('${ds}')"`:'';
+    const cur=isAth?'cursor:pointer;':'';
+    // assigned workout chips (athlete: show done/pending; click handled by day)
+    const woChips=wos.map(w=>{const done=workoutDone(w);
+      return `<div style="margin-top:3px;font-size:10px;color:${done?'#218a4e':'#b35e00'};background:${done?'#e3f7ec':'#fff2e2'};border-radius:5px;padding:1px 4px" title="${esc(w.description)}">${done?'✓':'★'} ${esc(w.type)}</div>`;}).join('');
+    const runChips=(isAth?freeRuns:runs).map(e=>`<div ${isAth?'':`onclick="viewEntry('${e.id}')"`} style="${isAth?'':'cursor:pointer;'}margin-top:3px;font-size:10.5px" class="tag t-${e.type==='Cross-train'?'Cross':e.type}">${(+e.distance||0)}${e.unit} ${esc(e.type)}</div>`).join('');
+    cells+=`<div ${click} style="border:1px solid var(--line);border-radius:10px;min-height:84px;padding:6px;${cur}background:${isToday?'#fff7ef':'#fff'};${isToday?'border-color:var(--orange)':''}">
       <div style="font-size:12px;font-weight:700;color:${isToday?'var(--orange)':'#6b7280'}">${d}</div>
-      ${runs.map(e=>`<div onclick="viewEntry('${e.id}')" style="cursor:pointer;margin-top:3px;font-size:10.5px" class="tag t-${e.type==='Cross-train'?'Cross':e.type}">${(+e.distance||0)}${e.unit} ${esc(e.type)}</div>`).join('')}
+      ${woChips}${runChips}
       ${miles>1&&runs.length>1?`<div style="font-size:10px;color:#6b7280;margin-top:2px">${miles.toFixed(1)} mi</div>`:''}
-      ${wos.map(w=>`<div style="margin-top:3px;font-size:10px;color:#b35e00;background:#fff2e2;border-radius:5px;padding:1px 4px" title="${esc(w.description)}">★ assigned</div>`).join('')}
     </div>`;
   }
   const monthName=CAL.toLocaleDateString('en-US',{month:'long',year:'numeric'});
   return `
-  <div class="page-title">Training Calendar${user&&SESSION.role==='admin'?' — '+esc((DB.get(KEY.users,[]).find(u=>u.username===user)||{}).name||user):''}</div>
-  <div class="page-sub">Your runs and assigned workouts, month by month.</div>
+  <div class="page-title">Training Calendar${!isAth&&user?' — '+esc((DB.get(KEY.users,[]).find(u=>u.username===user)||{}).name||user):''}</div>
+  <div class="page-sub">${isAth?'Tap any day to see your assigned run and log it.':'Runs and assigned workouts, month by month.'}</div>
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
       <button class="btn btn-ghost btn-sm" onclick="calMove(-1)">← Prev</button>
@@ -666,6 +691,48 @@ function calendarFor(user){
   </div>`;
 }
 function calMove(n){CAL.setMonth(CAL.getMonth()+n);go('calendar')}
+
+/* Athlete: day detail panel — assigned runs to complete + logged runs */
+function openDay(ds){
+  const user=SESSION.username;
+  const wos=workoutsOf(user).filter(w=>w.date===ds);
+  const runs=entriesOf(user).filter(e=>e.date===ds);
+  const linked={}; runs.forEach(e=>{if(e.workoutId)linked[e.workoutId]=e;});
+  let body='';
+  if(wos.length){
+    body+=`<div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">Assigned</div>`;
+    body+=wos.map(w=>{
+      const done=linked[w.id];
+      return `<div class="card" style="box-shadow:none;margin-bottom:10px;border-left:4px solid ${done?'var(--good)':'var(--orange)'}">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <div>${typeTag(w.type)} ${done?'<span style="color:var(--good);font-weight:700;font-size:12px">✓ Completed</span>':''}</div>
+        </div>
+        <div style="margin:8px 0;font-size:13px">${esc(w.description)}</div>
+        ${done
+          ? `<div style="font-size:12px;color:#6b7280">${(+done.distance||0)} ${done.unit} · ${secsToHMS(done.dur)} · ${paceFrom(+done.distance,done.unit,done.dur)}</div>
+             <div class="form-actions"><button class="btn btn-ghost btn-sm" onclick="viewEntry('${done.id}')">View</button><button class="btn btn-navy btn-sm" onclick="closeModal();editEntry('${done.id}')">Edit</button></div>`
+          : `<div class="form-actions"><button class="btn btn-primary btn-sm" onclick="completeWorkout('${w.id}')">✓ Complete this run</button></div>`}
+      </div>`;
+    }).join('');
+  }
+  const freeRuns=runs.filter(e=>!e.workoutId);
+  if(freeRuns.length){
+    body+=`<div style="font-size:12px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.4px;margin:6px 0">Other runs logged</div>`;
+    body+=freeRuns.map(e=>`<div class="card" style="box-shadow:none;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>${typeTag(e.type)} <span style="font-size:13px">${(+e.distance||0)} ${e.unit} · ${paceFrom(+e.distance,e.unit,e.dur)}</span></div>
+        <div class="inline-actions"><button class="btn btn-ghost btn-sm" onclick="viewEntry('${e.id}')">View</button><button class="btn btn-ghost btn-sm" onclick="closeModal();editEntry('${e.id}')">Edit</button></div>
+      </div></div>`).join('');
+  }
+  if(!wos.length && !freeRuns.length){
+    body+=`<div class="empty" style="padding:18px">Nothing assigned for this day.</div>`;
+  }
+  const html=`
+    <h3>${fmtDate(ds)} <button class="x" onclick="closeModal()">×</button></h3>
+    ${body}
+    <div class="form-actions" style="margin-top:6px"><button class="btn btn-ghost btn-sm" onclick="logRun('${ds}')">+ Log a run for this day</button></div>`;
+  openModal(html);
+}
 
 /* ============================================================
    ATHLETE: GOALS
